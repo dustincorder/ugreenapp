@@ -24,9 +24,9 @@ impl ProtocolType {
                     eq: true,
                     dual_link: true,
                     find: true,
-                    spatial_audio: false,
+                    spatial_audio: true,
                     wear_detection: false,
-                    high_quality: false,
+                    high_quality: true,
                     wind_noise: false,
                     audio_share: false,
                     ai: false,
@@ -97,6 +97,10 @@ pub enum ProtocolCommand {
     SetPromptLanguage { value: String },
     SetPromptVolume { value: u8 },
     SetWearDetection { enabled: bool },
+    SetGameMode { enabled: bool },
+    SetDualConnect { enabled: bool },
+    SetSpatialAudio { enabled: bool },
+    SetHighQuality { enabled: bool },
     FactoryReset,
 }
 
@@ -110,6 +114,10 @@ impl ProtocolCommand {
             ProtocolCommand::SetPromptLanguage { .. } => "SetPromptLanguage",
             ProtocolCommand::SetPromptVolume { .. } => "SetPromptVolume",
             ProtocolCommand::SetWearDetection { .. } => "SetWearDetection",
+            ProtocolCommand::SetGameMode { .. } => "SetGameMode",
+            ProtocolCommand::SetDualConnect { .. } => "SetDualConnect",
+            ProtocolCommand::SetSpatialAudio { .. } => "SetSpatialAudio",
+            ProtocolCommand::SetHighQuality { .. } => "SetHighQuality",
             ProtocolCommand::FactoryReset => "FactoryReset",
         }
     }
@@ -143,6 +151,10 @@ impl ProtocolCommand {
             }
             ProtocolCommand::SetPromptVolume { value } => json!({ "volume": value }),
             ProtocolCommand::SetWearDetection { enabled } => json!({ "enabled": enabled }),
+            ProtocolCommand::SetGameMode { enabled } => json!({ "enabled": enabled }),
+            ProtocolCommand::SetDualConnect { enabled } => json!({ "enabled": enabled }),
+            ProtocolCommand::SetSpatialAudio { enabled } => json!({ "enabled": enabled }),
+            ProtocolCommand::SetHighQuality { enabled } => json!({ "enabled": enabled }),
             ProtocolCommand::FactoryReset => json!({ "command": "FACTORY_RESET" }),
         }
     }
@@ -251,10 +263,14 @@ const UG1_HW_HEADER: [u8; 3] = [0x85, 0x86, 0x87];
 const UG1_CMD_VERSION: u8 = 1;
 const UG1_CMD_DEVICE_STATE: u8 = 4;
 const UG1_CMD_EQ: u8 = 5;
+const UG1_CMD_DUAL_CONNECT: u8 = 6;
+const UG1_CMD_GAME_MODE: u8 = 8;
 const UG1_CMD_NOISE_REDUCTION: u8 = 9;
+const UG1_CMD_HIGH_QUALITY: u8 = 11;
 const UG1_CMD_PROMPT_LANG: u8 = 12;
 const UG1_CMD_FACTORY_RESET: u8 = 14;
 const UG1_CMD_SOUND_VOLUME: u8 = 17;
+const UG1_CMD_SPATIAL_AUDIO: u8 = 18;
 const UG1_CMD_WEAR_DETECTION: u8 = 19;
 
 const UG2_CUSTOM_OPCODE: u8 = 0xFF;
@@ -441,6 +457,34 @@ fn encode_ug1(command: &ProtocolCommand, payload: &Value) -> Result<Vec<u8>> {
                 .ok_or_else(|| anyhow!("UG1 WEAR_DETECTION payload is missing enabled"))?;
             (UG1_CMD_WEAR_DETECTION, vec![u8::from(enabled)])
         }
+        ProtocolCommand::SetGameMode { .. } => {
+            let enabled = payload
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow!("UG1 GAME_MODE payload is missing enabled"))?;
+            (UG1_CMD_GAME_MODE, vec![u8::from(enabled)])
+        }
+        ProtocolCommand::SetDualConnect { .. } => {
+            let enabled = payload
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow!("UG1 DUAL_CONNECT payload is missing enabled"))?;
+            (UG1_CMD_DUAL_CONNECT, vec![u8::from(enabled)])
+        }
+        ProtocolCommand::SetSpatialAudio { .. } => {
+            let enabled = payload
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow!("UG1 SPATIAL_AUDIO payload is missing enabled"))?;
+            (UG1_CMD_SPATIAL_AUDIO, vec![u8::from(enabled)])
+        }
+        ProtocolCommand::SetHighQuality { .. } => {
+            let enabled = payload
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow!("UG1 HIGH_QUALITY payload is missing enabled"))?;
+            (UG1_CMD_HIGH_QUALITY, vec![u8::from(enabled)])
+        }
         ProtocolCommand::FactoryReset => (UG1_CMD_FACTORY_RESET, vec![0]),
     };
 
@@ -521,15 +565,32 @@ fn parse_ug1_data(command_id: u8, payload: &[u8]) -> Value {
         UG1_CMD_EQ => json!({
             "eqMode": payload.first().copied().map(eq_value_to_mode).unwrap_or("classic"),
         }),
+        UG1_CMD_DUAL_CONNECT => json!({
+            "dualLink": payload.first().copied().unwrap_or(0) != 0,
+        }),
+        UG1_CMD_GAME_MODE => json!({
+            "gameMode": payload.first().copied().unwrap_or(0) != 0,
+        }),
         UG1_CMD_NOISE_REDUCTION => json!({
             "ancMode": payload.first().copied().map(ug1_anc_value_to_mode).unwrap_or("unknown"),
             "ancDepth": payload.first().copied().map(ug1_anc_value_to_depth).unwrap_or("unknown"),
         }),
+        UG1_CMD_HIGH_QUALITY => {
+            let hq = payload.first().copied().unwrap_or(0) != 0;
+            json!({
+                "highQuality": hq,
+                "gameMode": if hq { false } else { true },
+                "dualLink": if hq { false } else { true },
+            })
+        }
         UG1_CMD_PROMPT_LANG => json!({
             "promptLanguage": payload.first().copied().map(prompt_language_from_value).unwrap_or("Unknown"),
         }),
         UG1_CMD_SOUND_VOLUME => json!({
             "promptVolume": payload.first().copied().unwrap_or(8),
+        }),
+        UG1_CMD_SPATIAL_AUDIO => json!({
+            "spatialAudio": payload.first().copied().unwrap_or(0) != 0,
         }),
         UG1_CMD_WEAR_DETECTION => json!({
             "wearDetection": payload.first().copied().unwrap_or(0) != 0,
@@ -543,13 +604,13 @@ fn parse_ug1_data(command_id: u8, payload: &[u8]) -> Value {
 }
 
 fn parse_ug1_device_state(payload: &[u8]) -> Value {
-    let battery_left = payload.first().copied().unwrap_or(0);
-    let battery_right = payload.get(1).copied();
-    let battery_box = payload.get(2).copied();
+    let b0 = payload.first().copied().unwrap_or(0xFF);
+    let b1 = payload.get(1).copied().unwrap_or(0xFF);
+    let b2 = payload.get(2).copied().unwrap_or(0xFF);
     let anc_raw = payload.get(3).copied().unwrap_or(0);
     let eq_raw = payload.get(4).copied().unwrap_or(0);
-    let dual_link = payload.get(5).copied().unwrap_or(0) != 0;
-    let game_mode = payload.get(6).copied().unwrap_or(0) != 0;
+    let mut dual_link = payload.get(5).copied().unwrap_or(0) != 0;
+    let mut game_mode = payload.get(6).copied().unwrap_or(0) != 0;
     let high_quality = payload.get(7).copied().unwrap_or(0) != 0;
     let sound_type = payload.get(16).copied();
     let prompt_volume = payload.get(19).copied();
@@ -558,13 +619,28 @@ fn parse_ug1_device_state(payload: &[u8]) -> Value {
     let audio_share = payload.get(24).copied().unwrap_or(0) != 0;
     let wind_noise = payload.get(25).copied().unwrap_or(0) != 0;
 
-    let mut battery = serde_json::Map::new();
-    battery.insert("left".into(), json!(battery_left));
-    if let Some(right) = battery_right.filter(|value| *value != 0xFF) {
-        battery.insert("right".into(), json!(right));
+    if high_quality {
+        dual_link = false;
+        game_mode = false;
     }
-    if let Some(box_level) = battery_box.filter(|value| *value != 0xFF) {
-        battery.insert("box".into(), json!(box_level));
+
+    let mut battery = serde_json::Map::new();
+    if b0 <= 100 {
+        battery.insert("left".into(), json!(b0));
+    }
+    if b1 <= 100 {
+        battery.insert("right".into(), json!(b1));
+    }
+    if b2 <= 100 {
+        battery.insert("box".into(), json!(b2));
+    }
+    if battery.is_empty() {
+        for &lvl in &[b0, b1, b2] {
+            if lvl <= 100 {
+                battery.insert("level".into(), json!(lvl));
+                break;
+            }
+        }
     }
 
     let mut value = json!({
@@ -594,13 +670,30 @@ fn parse_ug1_device_state(payload: &[u8]) -> Value {
 
 fn parse_ug1_hardware_data(command_id: u8, payload: &[u8]) -> Value {
     match command_id {
-        1 => json!({
-            "battery": {
-                "left": payload.first().copied().unwrap_or(0),
-                "right": payload.get(1).copied().unwrap_or(0),
-                "box": payload.get(2).copied().unwrap_or(0),
+        1 => {
+            let b0 = payload.first().copied().unwrap_or(0xFF);
+            let b1 = payload.get(1).copied().unwrap_or(0xFF);
+            let b2 = payload.get(2).copied().unwrap_or(0xFF);
+            let mut battery = serde_json::Map::new();
+            if b0 <= 100 {
+                battery.insert("left".into(), json!(b0));
             }
-        }),
+            if b1 <= 100 {
+                battery.insert("right".into(), json!(b1));
+            }
+            if b2 <= 100 {
+                battery.insert("box".into(), json!(b2));
+            }
+            if battery.is_empty() {
+                for &lvl in &[b0, b1, b2] {
+                    if lvl <= 100 {
+                        battery.insert("level".into(), json!(lvl));
+                        break;
+                    }
+                }
+            }
+            json!({ "battery": battery })
+        }
         2 => {
             let noise = payload.first().copied().unwrap_or(0);
             json!({
@@ -609,7 +702,8 @@ fn parse_ug1_hardware_data(command_id: u8, payload: &[u8]) -> Value {
                 "ancDepth": ug1_anc_value_to_depth(noise),
             })
         }
-        5 => json!({ "gameMode": payload.first().copied().unwrap_or(0) != 0 }),
+        4 => json!({ "gameMode": payload.first().copied().unwrap_or(0) != 0 }),
+        5 => json!({ "eqMode": payload.first().copied().map(eq_value_to_mode).unwrap_or("classic") }),
         9 => json!({
             "findLeft": payload.first().copied().unwrap_or(0),
             "findRight": payload.get(1).copied().unwrap_or(0),
@@ -638,10 +732,14 @@ fn ug1_command_name(command_id: u8) -> &'static str {
         UG1_CMD_VERSION => "GET_VERSION",
         UG1_CMD_DEVICE_STATE => "GET_INFO",
         UG1_CMD_EQ => "EQ_SET",
+        UG1_CMD_DUAL_CONNECT => "DUAL_CONNECT",
+        UG1_CMD_GAME_MODE => "GAME_MODE",
         UG1_CMD_NOISE_REDUCTION => "ANC_MODE",
+        UG1_CMD_HIGH_QUALITY => "HIGH_QUALITY",
         UG1_CMD_PROMPT_LANG => "PROMPT_LANG",
         UG1_CMD_FACTORY_RESET => "FACTORY_RESET",
         UG1_CMD_SOUND_VOLUME => "PROMPT_VOL",
+        UG1_CMD_SPATIAL_AUDIO => "SPATIAL_AUDIO",
         UG1_CMD_WEAR_DETECTION => "WEAR_DETECTION",
         _ => "UNKNOWN",
     }
@@ -705,6 +803,12 @@ fn encode_ug2(command: &ProtocolCommand, payload: &Value, seq: u8) -> Result<Vec
         }
         ProtocolCommand::SetWearDetection { .. } => {
             return Err(anyhow!("UG2 wear detection is not implemented yet"));
+        }
+        ProtocolCommand::SetGameMode { .. }
+        | ProtocolCommand::SetDualConnect { .. }
+        | ProtocolCommand::SetSpatialAudio { .. }
+        | ProtocolCommand::SetHighQuality { .. } => {
+            return Err(anyhow!("UG2 command `{}` is not implemented yet", command.name()));
         }
         ProtocolCommand::FactoryReset => (UG2_MAGIC_FACTORY_RESET, Vec::new()),
     };
@@ -906,24 +1010,24 @@ fn normalize_anc_depth(depth: u8) -> &'static str {
 
 fn map_ug1_anc_mode_value(value: &str) -> u8 {
     match value {
-        "off" => 0,
-        "transparent" => 2,
-        "deep" => 161,
-        "medium" => 177,
-        "light" => 193,
-        "adaptive" => 209,
+        "off" => 208, // 0xD0
+        "transparent" | "transparency" => 210, // 0xD2
+        "deep" => 161, // 0xA1
+        "medium" => 177, // 0xB1
+        "light" => 193, // 0xC1
+        "adaptive" => 209, // 0xD1
         _ => 209,
     }
 }
 
 fn map_ug1_anc_depth_value(value: &str) -> u8 {
     match value {
-        "deep" => 161,
-        "medium" => 177,
-        "light" => 193,
-        "adaptive" => 209,
-        "transparent" => 2,
-        "off" => 0,
+        "deep" => 161, // 0xA1
+        "medium" => 177, // 0xB1
+        "light" => 193, // 0xC1
+        "adaptive" => 209, // 0xD1
+        "transparent" | "transparency" => 210, // 0xD2
+        "off" => 208, // 0xD0
         _ => 177,
     }
 }
@@ -957,11 +1061,10 @@ fn ug1_anc_value_to_mode(value: u8) -> &'static str {
 
 fn ug1_anc_value_to_depth(value: u8) -> &'static str {
     match value {
-        161 | 162 => "deep",
-        177 | 178 => "medium",
-        193 | 194 => "light",
-        209 | 210 | 1 | 2 => "adaptive",
-        0 | 160 | 176 | 192 | 208 => "off",
+        160..=162 => "deep",
+        176..=178 => "medium",
+        192..=194 => "light",
+        208..=210 | 0..=2 => "adaptive",
         _ => "unknown",
     }
 }
@@ -986,58 +1089,58 @@ fn anc_depth_from_value(value: u8) -> &'static str {
 
 fn normalize_eq_mode(mode: &str) -> &'static str {
     match mode.to_ascii_lowercase().as_str() {
-        "balanced" | "classic" => "classic",
-        "bass" => "bass",
-        "pop" => "pop",
         "jazz" => "jazz",
         "electronic" => "electronic",
-        "folk" => "folk",
+        "pop" | "popular" => "pop",
+        "classical" => "classical",
         "rock" => "rock",
+        "bass" => "bass",
         "treble" => "treble",
+        "classic" | "balanced" | "default" => "classic",
         _ => "classic",
     }
 }
 
 fn eq_mode_to_value(mode: &str) -> u8 {
     match normalize_eq_mode(mode) {
-        "bass" => 1,
-        "pop" => 2,
-        "classic" => 3,
-        "jazz" => 4,
-        "electronic" => 5,
-        "folk" => 6,
-        "rock" => 7,
-        "treble" => 8,
-        _ => 3,
+        "jazz" => 1,
+        "electronic" => 2,
+        "pop" => 3,
+        "classical" => 4,
+        "rock" => 5,
+        "bass" => 6,
+        "treble" => 7,
+        "classic" => 8,
+        _ => 8,
     }
 }
 
 fn eq_value_to_mode(value: u8) -> &'static str {
     match value {
-        1 => "bass",
-        2 => "pop",
-        3 => "classic",
-        4 => "jazz",
-        5 => "electronic",
-        6 => "folk",
-        7 => "rock",
-        8 => "treble",
+        1 => "jazz",
+        2 => "electronic",
+        3 => "pop",
+        4 => "classical",
+        5 => "rock",
+        6 => "bass",
+        7 => "treble",
+        8 => "classic",
         _ => "classic",
     }
 }
 
 fn normalize_prompt_language(value: &str) -> u8 {
     match value.to_ascii_lowercase().as_str() {
-        "chinese" | "zh" | "zh-cn" => 0,
-        "english" | "en" | "en-us" => 1,
-        _ => 1,
+        "english" | "en" | "en-us" => 0,
+        "chinese" | "zh" | "zh-cn" => 1,
+        _ => 0,
     }
 }
 
 fn prompt_language_from_value(value: u8) -> &'static str {
     match value {
-        0 => "Chinese",
-        1 => "English",
+        0 => "English",
+        1 => "Chinese",
         _ => "Unknown",
     }
 }
@@ -1109,3 +1212,121 @@ fn crc16(bytes: &[u8]) -> u16 {
     }
     crc
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ug1_encode_switches() {
+        let commands = [
+            (ProtocolCommand::SetGameMode { enabled: true }, UG1_CMD_GAME_MODE, vec![1]),
+            (ProtocolCommand::SetGameMode { enabled: false }, UG1_CMD_GAME_MODE, vec![0]),
+            (ProtocolCommand::SetDualConnect { enabled: true }, UG1_CMD_DUAL_CONNECT, vec![1]),
+            (ProtocolCommand::SetDualConnect { enabled: false }, UG1_CMD_DUAL_CONNECT, vec![0]),
+            (ProtocolCommand::SetSpatialAudio { enabled: true }, UG1_CMD_SPATIAL_AUDIO, vec![1]),
+            (ProtocolCommand::SetSpatialAudio { enabled: false }, UG1_CMD_SPATIAL_AUDIO, vec![0]),
+            (ProtocolCommand::SetHighQuality { enabled: true }, UG1_CMD_HIGH_QUALITY, vec![1]),
+            (ProtocolCommand::SetHighQuality { enabled: false }, UG1_CMD_HIGH_QUALITY, vec![0]),
+        ];
+
+        for (cmd, expected_cmd_id, expected_data) in commands {
+            let payload = cmd.payload(ProtocolType::Ug1);
+            let encoded = encode_ug1(&cmd, &payload).expect("encode_ug1 failed");
+            assert_eq!(encoded[0..3], UG1_REQ_HEADER);
+            assert_eq!(encoded[3], expected_cmd_id);
+            assert_eq!(encoded[4], expected_data.len() as u8);
+            assert_eq!(&encoded[5..5 + expected_data.len()], expected_data.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_ug1_anc_mappings() {
+        assert_eq!(map_ug1_anc_mode_value("off"), 208);
+        assert_eq!(map_ug1_anc_mode_value("transparent"), 210);
+        assert_eq!(map_ug1_anc_mode_value("transparency"), 210);
+        assert_eq!(map_ug1_anc_mode_value("adaptive"), 209);
+        assert_eq!(map_ug1_anc_mode_value("deep"), 161);
+        assert_eq!(map_ug1_anc_mode_value("medium"), 177);
+        assert_eq!(map_ug1_anc_mode_value("light"), 193);
+
+        assert_eq!(ug1_anc_value_to_mode(208), "off");
+        assert_eq!(ug1_anc_value_to_mode(210), "transparent");
+        assert_eq!(ug1_anc_value_to_mode(209), "adaptive");
+        assert_eq!(ug1_anc_value_to_mode(161), "adaptive");
+        assert_eq!(ug1_anc_value_to_mode(177), "adaptive");
+        assert_eq!(ug1_anc_value_to_mode(193), "adaptive");
+
+        assert_eq!(ug1_anc_value_to_depth(161), "deep");
+        assert_eq!(ug1_anc_value_to_depth(177), "medium");
+        assert_eq!(ug1_anc_value_to_depth(193), "light");
+        assert_eq!(ug1_anc_value_to_depth(209), "adaptive");
+        assert_eq!(ug1_anc_value_to_depth(210), "adaptive");
+    }
+
+    #[test]
+    fn test_eq_mappings() {
+        let expected = [
+            ("jazz", 1),
+            ("electronic", 2),
+            ("pop", 3),
+            ("classical", 4),
+            ("rock", 5),
+            ("bass", 6),
+            ("treble", 7),
+            ("classic", 8),
+        ];
+
+        for (name, val) in expected {
+            assert_eq!(eq_mode_to_value(name), val);
+            assert_eq!(eq_value_to_mode(val), name);
+        }
+    }
+
+    #[test]
+    fn test_prompt_language() {
+        assert_eq!(normalize_prompt_language("english"), 0);
+        assert_eq!(normalize_prompt_language("en"), 0);
+        assert_eq!(normalize_prompt_language("chinese"), 1);
+        assert_eq!(normalize_prompt_language("zh"), 1);
+
+        assert_eq!(prompt_language_from_value(0), "English");
+        assert_eq!(prompt_language_from_value(1), "Chinese");
+    }
+
+    #[test]
+    fn test_ug1_device_state_battery_and_ldac_exclusion() {
+        // [b0, b1, b2, anc, eq, dual_link, game_mode, high_quality, ...]
+        let mut payload = vec![0u8; 30];
+        payload[0] = 0xFF; // single headphone left invalid
+        payload[1] = 85;   // right = 85%
+        payload[2] = 0xFF; // box invalid
+        payload[5] = 1;    // dual_link requested true
+        payload[6] = 1;    // game_mode requested true
+        payload[7] = 1;    // high_quality (LDAC) is ON
+
+        let state = parse_ug1_device_state(&payload);
+        assert_eq!(state["battery"]["right"], 85);
+        assert!(state["battery"]["left"].is_null());
+        assert_eq!(state["highQuality"], true);
+        // LDAC mutual exclusion
+        assert_eq!(state["dualLink"], false);
+        assert_eq!(state["gameMode"], false);
+    }
+
+    #[test]
+    fn test_ug1_hardware_report_parsing() {
+        let game_mode_data = parse_ug1_hardware_data(4, &[1]);
+        assert_eq!(game_mode_data["gameMode"], true);
+
+        let eq_data = parse_ug1_hardware_data(5, &[1]);
+        assert_eq!(eq_data["eqMode"], "jazz");
+
+        let spatial_data = parse_ug1_hardware_data(10, &[1]);
+        assert_eq!(spatial_data["spatialAudio"], true);
+
+        let dual_link_data = parse_ug1_hardware_data(12, &[1]);
+        assert_eq!(dual_link_data["dualLink"], true);
+    }
+}
+

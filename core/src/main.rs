@@ -122,6 +122,10 @@ fn print_help() {
     println!("  lang <english|chinese>");
     println!("  vol <1-15>");
     println!("  wear <true|false>");
+    println!("  game <true|false>");
+    println!("  dual <true|false>");
+    println!("  spatial <true|false>");
+    println!("  hq <true|false>");
     println!("  factory-reset --yes-really-reset-device");
 }
 
@@ -205,6 +209,30 @@ enum Command {
         /// true/false
         enabled: bool,
     },
+    /// Enable or disable game mode (low latency)
+    #[command(visible_aliases = ["game", "game-mode"])]
+    SetGameMode {
+        /// true/false
+        enabled: bool,
+    },
+    /// Enable or disable dual connection (multipoint)
+    #[command(visible_aliases = ["dual", "dual-connect", "multipoint"])]
+    SetDualConnect {
+        /// true/false
+        enabled: bool,
+    },
+    /// Enable or disable spatial audio
+    #[command(visible_aliases = ["spatial", "spatial-audio"])]
+    SetSpatialAudio {
+        /// true/false
+        enabled: bool,
+    },
+    /// Enable or disable high quality decoding (LDAC)
+    #[command(visible_aliases = ["hq", "ldac", "high-quality"])]
+    SetHighQuality {
+        /// true/false
+        enabled: bool,
+    },
     /// Perform a factory reset of the active device
     FactoryReset {
         /// Required to unlock destructive reset on a real device
@@ -224,6 +252,10 @@ impl Command {
                 | Command::SetPromptLanguage { .. }
                 | Command::SetPromptVolume { .. }
                 | Command::SetWearDetection { .. }
+                | Command::SetGameMode { .. }
+                | Command::SetDualConnect { .. }
+                | Command::SetSpatialAudio { .. }
+                | Command::SetHighQuality { .. }
                 | Command::FactoryReset { .. }
         )
     }
@@ -292,6 +324,18 @@ impl Command {
             }
             Command::SetWearDetection { enabled } => state
                 .apply_protocol_command(ProtocolCommand::SetWearDetection { enabled: *enabled })?,
+            Command::SetGameMode { enabled } => {
+                state.apply_protocol_command(ProtocolCommand::SetGameMode { enabled: *enabled })?
+            }
+            Command::SetDualConnect { enabled } => {
+                state.apply_protocol_command(ProtocolCommand::SetDualConnect { enabled: *enabled })?
+            }
+            Command::SetSpatialAudio { enabled } => {
+                state.apply_protocol_command(ProtocolCommand::SetSpatialAudio { enabled: *enabled })?
+            }
+            Command::SetHighQuality { enabled } => {
+                state.apply_protocol_command(ProtocolCommand::SetHighQuality { enabled: *enabled })?
+            }
             Command::FactoryReset {
                 yes_really_reset_device,
             } => {
@@ -545,6 +589,31 @@ impl AppState {
                 device.wear_detection = *enabled;
                 json!({ "wearDetection": device.wear_detection, "success": response.success })
             }
+            ProtocolCommand::SetGameMode { enabled } => {
+                device.game_mode = *enabled;
+                json!({ "gameMode": device.game_mode, "success": response.success })
+            }
+            ProtocolCommand::SetDualConnect { enabled } => {
+                device.dual_link = *enabled;
+                json!({ "dualLink": device.dual_link, "success": response.success })
+            }
+            ProtocolCommand::SetSpatialAudio { enabled } => {
+                device.spatial_audio = *enabled;
+                json!({ "spatialAudio": device.spatial_audio, "success": response.success })
+            }
+            ProtocolCommand::SetHighQuality { enabled } => {
+                device.high_quality = *enabled;
+                if *enabled {
+                    device.dual_link = false;
+                    device.game_mode = false;
+                }
+                json!({
+                    "highQuality": device.high_quality,
+                    "dualLink": device.dual_link,
+                    "gameMode": device.game_mode,
+                    "success": response.success
+                })
+            }
             ProtocolCommand::FactoryReset => {
                 device.factory_reset();
                 json!({ "status": "factory_reset", "success": response.success })
@@ -630,6 +699,10 @@ impl AppState {
             | Command::SetPromptLanguage { .. }
             | Command::SetPromptVolume { .. }
             | Command::SetWearDetection { .. }
+            | Command::SetGameMode { .. }
+            | Command::SetDualConnect { .. }
+            | Command::SetSpatialAudio { .. }
+            | Command::SetHighQuality { .. }
             | Command::FactoryReset { .. } => self.print_active_device_summary(),
         }
     }
@@ -1019,14 +1092,14 @@ fn catalog_device_for_name(name: &str, mac_address: &str) -> Option<Device> {
 
 fn normalize_cli_eq_mode(mode: &str) -> &'static str {
     match mode.to_ascii_lowercase().as_str() {
-        "balanced" | "classic" => "classic",
-        "bass" => "bass",
-        "pop" => "pop",
         "jazz" => "jazz",
         "electronic" => "electronic",
-        "folk" => "folk",
+        "pop" | "popular" => "pop",
+        "classical" => "classical",
         "rock" => "rock",
+        "bass" => "bass",
         "treble" => "treble",
+        "balanced" | "classic" | "default" => "classic",
         _ => "classic",
     }
 }
