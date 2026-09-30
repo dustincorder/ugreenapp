@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use crate::protocol::{
     DecodedFrame, ProtocolCommand, ProtocolFacade, ProtocolType, UgProtocolFacade,
-    find_complete_rcsp_frame, find_complete_ug1_frame, unwrap_rcsp_custom, wrap_rcsp_custom,
+    find_complete_rcsp_frame, find_complete_ug1_frame, find_ug1_reject_frame, unwrap_rcsp_custom,
+    wrap_rcsp_custom,
 };
 
 pub struct TransportTarget {
@@ -307,6 +308,12 @@ fn read_complete_direct_frame(socket: &mut File, protocol: ProtocolType) -> Resu
             return Err(anyhow!("direct protocol poll failed"));
         }
         if ready == 0 {
+            // Nothing more is coming: a short reject frame is the whole answer.
+            if protocol == ProtocolType::Ug1 {
+                if let Some(frame) = find_ug1_reject_frame(&buffer) {
+                    return Ok(frame);
+                }
+            }
             continue;
         }
 

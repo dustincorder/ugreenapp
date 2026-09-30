@@ -4,15 +4,20 @@ mod transport;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use protocol::{FeatureSupport, ProtocolCommand, ProtocolType};
+use protocol::{FeatureSupport, ProtocolCommand, ProtocolType, UG1_REJECTED};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::process::Command as ProcessCommand;
+use std::thread;
+use std::time::Duration;
 use transport::{LinuxTransport, Transport, TransportTarget};
 
 const MAX_LOGS: usize = 200;
+/// A setting change makes the headset play a ~1.2 s voice prompt, and it rejects
+/// commands until the prompt ends.
+const REJECT_RETRY_DELAY: Duration = Duration::from_millis(1500);
 
 fn main() -> Result<()> {
     let args = AppArgs::parse();
@@ -132,6 +137,15 @@ fn print_help() {
 fn run_command(command: Command, state: &mut AppState, json_output: bool) -> Result<()> {
     state.ensure_active_device_for_command(&command)?;
     command.execute(state)?;
+    // A one-shot run starts from catalog defaults, so re-read the device to report
+    // its real state instead of placeholders for everything but the changed field.
+    // Best effort: the setting is already applied, and some (LDAC) make the
+    // headset reconnect, so a failed read must not turn the command into an error.
+    if command.changes_device_setting() {
+        if let Err(error) = state.apply_protocol_command(ProtocolCommand::QueryInfo) {
+            state.log("warn", "refresh_after_set", json!({ "error": error.to_string() }));
+        }
+    }
     if json_output {
         state.print_snapshot()?;
     } else {
@@ -206,32 +220,50 @@ enum Command {
     /// Enable or disable wear detection
     #[command(visible_aliases = ["wear", "ear-detect"])]
     SetWearDetection {
-        /// true/false
+        /// on/off (also true/false, 1/0)
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_switch)]
         enabled: bool,
     },
     /// Enable or disable game mode (low latency)
     #[command(visible_aliases = ["game", "game-mode"])]
     SetGameMode {
-        /// true/false
+        /// on/off (also true/false, 1/0)
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_switch)]
         enabled: bool,
     },
     /// Enable or disable dual connection (multipoint)
     #[command(visible_aliases = ["dual", "dual-connect", "multipoint"])]
     SetDualConnect {
-        /// true/false
+        /// on/off (also true/false, 1/0)
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_switch)]
         enabled: bool,
     },
     /// Enable or disable spatial audio
     #[command(visible_aliases = ["spatial", "spatial-audio"])]
     SetSpatialAudio {
-        /// true/false
+        /// on/off (also true/false, 1/0)
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_switch)]
         enabled: bool,
     },
     /// Enable or disable high quality decoding (LDAC)
     #[command(visible_aliases = ["hq", "ldac", "high-quality"])]
     SetHighQuality {
-        /// true/false
+        /// on/off (also true/false, 1/0)
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_switch)]
         enabled: bool,
+    },
+    /// Set what the ANC/left button does per press: none, anc, game, or a raw code
+    /// (codes are model-specific; `anc`=8 and `game`=7 are the HiTune Max5 values)
+    #[command(visible_aliases = ["buttons", "keys"])]
+    SetButtons {
+        #[arg(value_parser = parse_button_action)]
+        tap: u8,
+        #[arg(value_parser = parse_button_action)]
+        double_tap: u8,
+        #[arg(value_parser = parse_button_action)]
+        triple_tap: u8,
+        #[arg(value_parser = parse_button_action)]
+        long_press: u8,
     },
     /// Perform a factory reset of the active device
     FactoryReset {
@@ -256,11 +288,27 @@ impl Command {
                 | Command::SetDualConnect { .. }
                 | Command::SetSpatialAudio { .. }
                 | Command::SetHighQuality { .. }
+                | Command::SetButtons { .. }
                 | Command::FactoryReset { .. }
         )
     }
 
+    /// Commands that change a setting on the device (everything else only reads).
+    fn changes_device_setting(&self) -> bool {
+        self.requires_active_device()
+            && !matches!(
+                self,
+                Command::QueryInfo | Command::QueryFirmware | Command::FactoryReset { .. }
+            )
+    }
+
     fn execute(&self, state: &mut AppState) -> Result<()> {
+        if self.requires_active_device() {
+            let device_name = &state.require_active_device()?.device_name;
+            if let Some(reason) = unsupported_reason(device_name, self) {
+                return Err(anyhow!("{device_name}: {reason}"));
+            }
+        }
         match self {
             Command::Scan => {
                 state.refresh_devices();
@@ -306,8 +354,9 @@ impl Command {
                 state.apply_protocol_command(ProtocolCommand::QueryFirmware)?
             }
             Command::SetAnc { mode, depth } => {
+                let device_name = state.require_active_device()?.device_name.clone();
                 state.apply_protocol_command(ProtocolCommand::SetAnc {
-                    mode: mode.clone(),
+                    mode: anc_mode_for_device(&device_name, mode),
                     depth: *depth,
                 })?
             }
@@ -334,7 +383,35 @@ impl Command {
                 state.apply_protocol_command(ProtocolCommand::SetSpatialAudio { enabled: *enabled })?
             }
             Command::SetHighQuality { enabled } => {
-                state.apply_protocol_command(ProtocolCommand::SetHighQuality { enabled: *enabled })?
+                // Any LDAC write, even of the current value, makes the headset drop and
+                // re-establish the audio link (~8 s of silence), so skip no-op writes.
+                state.apply_protocol_command(ProtocolCommand::QueryInfo)?;
+                if state.require_active_device()?.high_quality == *enabled {
+                    state.log("info", "unchanged", json!({ "highQuality": enabled }));
+                } else {
+                    state.apply_protocol_command(ProtocolCommand::SetHighQuality {
+                        enabled: *enabled,
+                    })?
+                }
+            }
+            Command::SetButtons {
+                tap,
+                double_tap,
+                triple_tap,
+                long_press,
+            } => {
+                // KEY_SETTING rewrites all 8 slots; keep the right-earbud half as
+                // reported, and refuse rather than zero it when the layout is unknown.
+                state.apply_protocol_command(ProtocolCommand::QueryInfo)?;
+                let mut actions = [0u8; 8];
+                let right = state
+                    .require_active_device()?
+                    .buttons
+                    .get(4..8)
+                    .ok_or_else(|| anyhow!("device did not report its button layout"))?;
+                actions[4..].copy_from_slice(right);
+                actions[..4].copy_from_slice(&[*tap, *double_tap, *triple_tap, *long_press]);
+                state.apply_protocol_command(ProtocolCommand::SetButtons { actions })?
             }
             Command::FactoryReset {
                 yes_really_reset_device,
@@ -363,7 +440,7 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         Self {
-            devices: detect_linux_devices().unwrap_or_else(|_| supported_devices()),
+            devices: available_devices(),
             scanning: false,
             connected: false,
             active_device_id: None,
@@ -373,9 +450,7 @@ impl AppState {
     }
 
     fn refresh_devices(&mut self) {
-        if let Ok(devices) = detect_linux_devices() {
-            self.devices = devices;
-        }
+        self.devices = available_devices();
     }
 
     fn ensure_active_device_for_command(&mut self, command: &Command) -> Result<()> {
@@ -440,7 +515,7 @@ impl AppState {
         Ok(TransportTarget {
             mac_address: device.mac_address.clone(),
             protocol: device.protocol_type,
-            rfcomm_channel: 1,
+            rfcomm_channel: resolve_rfcomm_channel(&device.device_name, &device.mac_address),
         })
     }
 
@@ -448,10 +523,28 @@ impl AppState {
         let protocol_type = self.active_protocol_type()?;
         let target = self.active_transport_target()?;
         let payload = command.payload(protocol_type);
-        let response = self
+        let mut response = self
             .transport
             .send(&target, &command, &payload)
             .map_err(|error| anyhow!("transport failed: {error}"))?;
+        if response.command == UG1_REJECTED {
+            self.log(
+                "warn",
+                "command_rejected",
+                json!({ "command": command.name(), "retrying": true }),
+            );
+            thread::sleep(REJECT_RETRY_DELAY);
+            response = self
+                .transport
+                .send(&target, &command, &payload)
+                .map_err(|error| anyhow!("transport failed: {error}"))?;
+        }
+        if response.command == UG1_REJECTED {
+            return Err(anyhow!(
+                "headset rejected `{}` (busy with a voice prompt, or unsupported value)",
+                command.name()
+            ));
+        }
         let details = {
             let device = self.require_active_device_mut()?;
             Self::apply_response_to_device(device, &command, &response)
@@ -539,6 +632,12 @@ impl AppState {
         if let Some(box_mac) = response.data.get("boxMac").and_then(Value::as_str) {
             device.mac_address = box_mac.to_string();
         }
+        if let Some(buttons) = response.data.get("buttons").and_then(Value::as_array) {
+            device.buttons = buttons
+                .iter()
+                .filter_map(|value| value.as_u64().map(|code| code as u8))
+                .collect();
+        }
         if let Some(battery) = response.data.get("battery") {
             if let Some(left) = battery.get("left").and_then(Value::as_u64) {
                 device.battery_left = left as u8;
@@ -613,6 +712,10 @@ impl AppState {
                     "gameMode": device.game_mode,
                     "success": response.success
                 })
+            }
+            ProtocolCommand::SetButtons { actions } => {
+                device.buttons = actions.to_vec();
+                json!({ "buttons": device.buttons, "success": response.success })
             }
             ProtocolCommand::FactoryReset => {
                 device.factory_reset();
@@ -703,6 +806,7 @@ impl AppState {
             | Command::SetDualConnect { .. }
             | Command::SetSpatialAudio { .. }
             | Command::SetHighQuality { .. }
+            | Command::SetButtons { .. }
             | Command::FactoryReset { .. } => self.print_active_device_summary(),
         }
     }
@@ -732,6 +836,9 @@ impl AppState {
                 device.high_quality,
                 device.wear_detection
             );
+            if !device.buttons.is_empty() {
+                println!("  Buttons: {:?}", device.buttons);
+            }
         } else {
             println!("No active device.");
         }
@@ -782,6 +889,8 @@ struct Device {
     high_quality: bool,
     audio_share: bool,
     ai_enabled: bool,
+    /// ANC/left button actions then right, as in the device state (model-specific codes).
+    buttons: Vec<u8>,
     features: FeatureSupport,
 }
 
@@ -826,6 +935,7 @@ impl Device {
             high_quality: definition.supports.high_quality,
             audio_share: definition.supports.audio_share,
             ai_enabled: definition.supports.ai,
+            buttons: Vec::new(),
             features: definition.supports.clone(),
         }
     }
@@ -859,6 +969,7 @@ impl Device {
             high_quality: self.high_quality,
             audio_share: self.audio_share,
             ai_enabled: self.ai_enabled,
+            buttons: self.buttons.clone(),
             features: self.features.clone(),
         }
     }
@@ -877,6 +988,7 @@ impl Device {
         self.high_quality = definition.supports.high_quality;
         self.audio_share = definition.supports.audio_share;
         self.ai_enabled = definition.supports.ai;
+        self.buttons.clear();
     }
 
     fn from_runtime(
@@ -916,6 +1028,7 @@ impl Device {
             high_quality: definition.supports.high_quality,
             audio_share: definition.supports.audio_share,
             ai_enabled: definition.supports.ai,
+            buttons: Vec::new(),
             features: definition.supports.clone(),
         }
     }
@@ -950,9 +1063,12 @@ struct DeviceSnapshot {
     high_quality: bool,
     audio_share: bool,
     ai_enabled: bool,
+    /// ANC/left button actions then right, as in the device state (model-specific codes).
+    buttons: Vec<u8>,
     features: FeatureSupport,
 }
 
+/// Placeholder devices for trying the CLI without a headset (`UGREEN_DEMO=1`).
 fn supported_devices() -> Vec<Device> {
     vec![
         Device::new(
@@ -1010,6 +1126,19 @@ fn supported_devices() -> Vec<Device> {
     ]
 }
 
+/// Connected headsets only. The demo catalog used to be the fallback, which made
+/// commands silently target a fake Max5c while the real headset was reconnecting;
+/// it is now opt-in via `UGREEN_DEMO=1`.
+fn available_devices() -> Vec<Device> {
+    match detect_linux_devices() {
+        Ok(devices) => devices,
+        Err(_) if std::env::var_os("UGREEN_DEMO").is_some_and(|value| value == "1") => {
+            supported_devices()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 fn detect_linux_devices() -> Result<Vec<Device>> {
     let output = ProcessCommand::new("bluetoothctl")
         .args(["devices", "Connected"])
@@ -1031,6 +1160,55 @@ fn detect_linux_devices() -> Result<Vec<Device>> {
 
     devices.sort_by(|left, right| left.device_name.cmp(&right.device_name));
     Ok(devices)
+}
+
+/// RFCOMM channel of the control port. Models differ (Max5c uses 1, Max5 uses 12):
+/// verified models keep their channel, others are looked up over SDP.
+/// `UGREEN_RFCOMM_CHANNEL` overrides both.
+fn resolve_rfcomm_channel(device_name: &str, mac_address: &str) -> u8 {
+    if let Some(channel) = std::env::var("UGREEN_RFCOMM_CHANNEL")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+    {
+        return channel;
+    }
+    if device_name == "UGREEN HiTune Max5c" {
+        return 1;
+    }
+    discover_serial_port_channel(mac_address).unwrap_or(1)
+}
+
+fn discover_serial_port_channel(mac_address: &str) -> Option<u8> {
+    // A targeted Serial Port search takes ~0.1 s; `sdptool records` walks every
+    // record handle and takes ~30 s.
+    let output = ProcessCommand::new("sdptool")
+        .args(["search", "--bdaddr", mac_address, "SP"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_serial_port_channel(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// First Serial Port record that is not the OTA service (vendor UUID 6666...).
+/// Records split on "Service RecHandle:"; each name line lands in the previous chunk,
+/// which is harmless since only UUIDs and the channel are inspected.
+fn parse_serial_port_channel(sdp_records: &str) -> Option<u8> {
+    const SERIAL_PORT_UUID: &str = "00001101-0000-1000-8000-00805f9b34fb";
+    sdp_records
+        .split("Service RecHandle:")
+        .skip(1)
+        .filter(|record| {
+            (record.contains("(0x1101)") || record.contains(SERIAL_PORT_UUID))
+                && !record.contains("66666666-")
+        })
+        .find_map(|record| {
+            record
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("Channel:"))
+                .and_then(|channel| channel.trim().parse().ok())
+        })
 }
 
 fn parse_bluetoothctl_device_line(line: &str) -> Option<(String, String)> {
@@ -1099,9 +1277,65 @@ fn normalize_cli_eq_mode(mode: &str) -> &'static str {
         "rock" => "rock",
         "bass" => "bass",
         "treble" => "treble",
+        "original" => "original",
         "balanced" | "classic" | "default" => "classic",
         _ => "classic",
     }
+}
+
+/// Button action names as offered by the official app for the HiTune Max5.
+/// Codes are firmware-specific (8 toggles EQ on other models), so raw codes pass through.
+fn parse_button_action(value: &str) -> Result<u8, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "none" | "off" => Ok(0),
+        "game" | "game-mode" => Ok(7),
+        "anc" | "noise" | "noise-control" => Ok(8),
+        other => other
+            .parse()
+            .map_err(|_| format!("expected none/anc/game or a number, got `{value}`")),
+    }
+}
+
+/// A plain `bool` positional is a value-less flag in clap, so toggles could only
+/// ever be switched on. Parse an explicit value instead.
+fn parse_switch(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" => Ok(true),
+        "off" | "false" | "0" | "no" => Ok(false),
+        _ => Err(format!("expected on/off, got `{value}`")),
+    }
+}
+
+/// Commands a model does not support, per the official app's model config. The
+/// headset never answers them, so they are refused up front instead of waiting out
+/// the transport timeout.
+fn unsupported_reason(device_name: &str, command: &Command) -> Option<&'static str> {
+    if device_name != "UGREEN HiTune Max5" {
+        return None;
+    }
+    match command {
+        Command::SetPromptVolume { .. } => Some("prompt volume is not supported"),
+        Command::SetSpatialAudio { .. } => Some("spatial audio is not supported"),
+        Command::SetWearDetection { .. } => Some("wear detection is not supported"),
+        _ => None,
+    }
+}
+
+/// Max5 uses its own values for off/transparency and has no adaptive ANC, so
+/// translate the generic CLI modes for it; other models keep the mode as given.
+fn anc_mode_for_device(device_name: &str, mode: &str) -> String {
+    if device_name != "UGREEN HiTune Max5" {
+        return mode.to_string();
+    }
+    // ANC depth lives in the high nibble: light 0xC1, medium 0xB1, deep 0xA1.
+    match normalize_cli_anc_mode(mode) {
+        "off" => "basic-off",
+        "transparent" => "basic-transparent",
+        "light" => "light",
+        "medium" => "medium",
+        _ => "deep",
+    }
+    .to_string()
 }
 
 fn normalize_cli_anc_mode(mode: &str) -> &'static str {
@@ -1133,5 +1367,122 @@ fn parse_cli_anc_depth(depth: &str) -> Option<u8> {
         "medium" => Some(2),
         "deep" => Some(3),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `sdptool search --bdaddr <mac> SP` output from a HiTune Max5.
+    const MAX5_SDP_SERIAL_PORT: &str = r#"Searching for SP on 98:47:44:6A:87:47 ...
+Service Name: UGREEN HiTune Max Lite
+Service RecHandle: 0x10004
+Service Class ID List:
+  UUID 128: 00001101-0000-1000-8000-00805f9b34fb
+Protocol Descriptor List:
+  "L2CAP" (0x0100)
+  "RFCOMM" (0x0003)
+    Channel: 12
+Profile Descriptor List:
+  "Serial Port" (0x1101)
+    Version: 0x0102
+
+Service Name: UGREEN HiTune Max Lite
+Service RecHandle: 0x10005
+Service Class ID List:
+  UUID 128: 00001101-0000-1000-8000-00805f9b34fb
+Protocol Descriptor List:
+  "L2CAP" (0x0100)
+  "RFCOMM" (0x0003)
+    Channel: 18
+Profile Descriptor List:
+  "Serial Port" (0x00001101-0000-1000-8000-00805f9b34fb)
+    Version: 0x0102
+
+Service Name: OTA1
+Service RecHandle: 0x10006
+Service Class ID List:
+  UUID 128: 66666666-6666-6666-6666-666666666666
+Protocol Descriptor List:
+  "L2CAP" (0x0100)
+  "RFCOMM" (0x0003)
+    Channel: 13
+Profile Descriptor List:
+  "Serial Port" (0x1101)
+    Version: 0x0102
+"#;
+
+    #[test]
+    fn serial_port_channel_skips_ota_record() {
+        assert_eq!(parse_serial_port_channel(MAX5_SDP_SERIAL_PORT), Some(12));
+    }
+
+    #[test]
+    fn serial_port_channel_accepts_long_form_uuid() {
+        let second_only = MAX5_SDP_SERIAL_PORT
+            .split("Service RecHandle: 0x10005")
+            .nth(1)
+            .map(|rest| format!("Service RecHandle: 0x10005{rest}"))
+            .unwrap();
+        assert_eq!(parse_serial_port_channel(&second_only), Some(18));
+    }
+
+    #[test]
+    fn serial_port_channel_ignores_ota_only_output() {
+        let ota_only = MAX5_SDP_SERIAL_PORT
+            .split("Service Name: OTA1")
+            .nth(1)
+            .map(|rest| format!("Service Name: OTA1{rest}"))
+            .unwrap();
+        assert_eq!(parse_serial_port_channel(&ota_only), None);
+        assert_eq!(parse_serial_port_channel(""), None);
+    }
+
+    #[test]
+    fn max5c_keeps_its_verified_channel() {
+        assert_eq!(resolve_rfcomm_channel("UGREEN HiTune Max5c", "00:00:00:00:00:00"), 1);
+    }
+
+    #[test]
+    fn switches_accept_explicit_values() {
+        assert_eq!(parse_switch("on"), Ok(true));
+        assert_eq!(parse_switch("FALSE"), Ok(false));
+        assert_eq!(parse_switch("0"), Ok(false));
+        assert!(parse_switch("maybe").is_err());
+    }
+
+    #[test]
+    fn toggles_can_be_switched_off() {
+        let args = AppArgs::try_parse_from(["ugreen_core", "game", "off"]).unwrap();
+        assert!(matches!(args.command, Some(Command::SetGameMode { enabled: false })));
+    }
+
+    #[test]
+    fn button_actions_accept_names_and_codes() {
+        assert_eq!(parse_button_action("none"), Ok(0));
+        assert_eq!(parse_button_action("anc"), Ok(8));
+        assert_eq!(parse_button_action("game"), Ok(7));
+        assert_eq!(parse_button_action("1"), Ok(1));
+        assert!(parse_button_action("ldac").is_err());
+    }
+
+    #[test]
+    fn max5_refuses_unsupported_commands() {
+        let max5 = "UGREEN HiTune Max5";
+        assert!(unsupported_reason(max5, &Command::SetPromptVolume { value: 8 }).is_some());
+        assert!(unsupported_reason(max5, &Command::SetSpatialAudio { enabled: false }).is_some());
+        assert!(unsupported_reason(max5, &Command::SetGameMode { enabled: false }).is_none());
+        let max5c = "UGREEN HiTune Max5c";
+        assert!(unsupported_reason(max5c, &Command::SetPromptVolume { value: 8 }).is_none());
+    }
+
+    #[test]
+    fn max5_anc_modes_use_its_own_values() {
+        assert_eq!(anc_mode_for_device("UGREEN HiTune Max5", "off"), "basic-off");
+        assert_eq!(anc_mode_for_device("UGREEN HiTune Max5", "transparency"), "basic-transparent");
+        assert_eq!(anc_mode_for_device("UGREEN HiTune Max5", "medium"), "medium");
+        assert_eq!(anc_mode_for_device("UGREEN HiTune Max5", "anc"), "deep");
+        assert_eq!(anc_mode_for_device("UGREEN HiTune Max5c", "off"), "off");
     }
 }

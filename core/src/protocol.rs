@@ -101,6 +101,9 @@ pub enum ProtocolCommand {
     SetDualConnect { enabled: bool },
     SetSpatialAudio { enabled: bool },
     SetHighQuality { enabled: bool },
+    /// Button actions, in device-state order: left/ANC tap, double, triple, long,
+    /// then the same four for the right earbud.
+    SetButtons { actions: [u8; 8] },
     FactoryReset,
 }
 
@@ -118,6 +121,7 @@ impl ProtocolCommand {
             ProtocolCommand::SetDualConnect { .. } => "SetDualConnect",
             ProtocolCommand::SetSpatialAudio { .. } => "SetSpatialAudio",
             ProtocolCommand::SetHighQuality { .. } => "SetHighQuality",
+            ProtocolCommand::SetButtons { .. } => "SetButtons",
             ProtocolCommand::FactoryReset => "FactoryReset",
         }
     }
@@ -155,6 +159,7 @@ impl ProtocolCommand {
             ProtocolCommand::SetDualConnect { enabled } => json!({ "enabled": enabled }),
             ProtocolCommand::SetSpatialAudio { enabled } => json!({ "enabled": enabled }),
             ProtocolCommand::SetHighQuality { enabled } => json!({ "enabled": enabled }),
+            ProtocolCommand::SetButtons { actions } => json!({ "actions": actions }),
             ProtocolCommand::FactoryReset => json!({ "command": "FACTORY_RESET" }),
         }
     }
@@ -259,6 +264,8 @@ impl ProtocolFacade for UgProtocolFacade {
 const UG1_REQ_HEADER: [u8; 3] = [0xAA, 0xBB, 0xCC];
 const UG1_RESP_HEADER: [u8; 3] = [0xDD, 0xEE, 0xFF];
 const UG1_HW_HEADER: [u8; 3] = [0x85, 0x86, 0x87];
+const UG1_REJECT_LEN: usize = 7;
+pub const UG1_REJECTED: &str = "REJECTED";
 
 const UG1_CMD_VERSION: u8 = 1;
 const UG1_CMD_DEVICE_STATE: u8 = 4;
@@ -266,6 +273,7 @@ const UG1_CMD_EQ: u8 = 5;
 const UG1_CMD_DUAL_CONNECT: u8 = 6;
 const UG1_CMD_GAME_MODE: u8 = 8;
 const UG1_CMD_NOISE_REDUCTION: u8 = 9;
+const UG1_CMD_KEY_SETTING: u8 = 10;
 const UG1_CMD_HIGH_QUALITY: u8 = 11;
 const UG1_CMD_PROMPT_LANG: u8 = 12;
 const UG1_CMD_FACTORY_RESET: u8 = 14;
@@ -409,6 +417,20 @@ pub fn find_complete_ug1_frame(buffer: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// A headset that is busy (e.g. still playing a voice prompt) or gets a value it does
+/// not support answers with a 7-byte frame `DD EE FF <value> 00 xx xx` instead of an
+/// ack. It shares its start with regular frames, so the transport only accepts it once
+/// the line has gone quiet.
+pub fn find_ug1_reject_frame(buffer: &[u8]) -> Option<Vec<u8>> {
+    let start = buffer.len().checked_sub(UG1_REJECT_LEN)?;
+    let frame = &buffer[start..];
+    (frame[0..3] == UG1_RESP_HEADER && frame[4] == 0).then(|| frame.to_vec())
+}
+
+fn is_ug1_reject_frame(bytes: &[u8]) -> bool {
+    bytes.len() == UG1_REJECT_LEN && bytes[0..3] == UG1_RESP_HEADER && bytes[4] == 0
+}
+
 fn encode_ug1(command: &ProtocolCommand, payload: &Value) -> Result<Vec<u8>> {
     let (command_id, data) = match command {
         ProtocolCommand::QueryInfo => (UG1_CMD_DEVICE_STATE, vec![0]),
@@ -485,6 +507,7 @@ fn encode_ug1(command: &ProtocolCommand, payload: &Value) -> Result<Vec<u8>> {
                 .ok_or_else(|| anyhow!("UG1 HIGH_QUALITY payload is missing enabled"))?;
             (UG1_CMD_HIGH_QUALITY, vec![u8::from(enabled)])
         }
+        ProtocolCommand::SetButtons { actions } => (UG1_CMD_KEY_SETTING, actions.to_vec()),
         ProtocolCommand::FactoryReset => (UG1_CMD_FACTORY_RESET, vec![0]),
     };
 
@@ -500,6 +523,14 @@ fn encode_ug1(command: &ProtocolCommand, payload: &Value) -> Result<Vec<u8>> {
 }
 
 fn decode_ug1(bytes: &[u8]) -> Result<DecodedFrame> {
+    if is_ug1_reject_frame(bytes) {
+        return Ok(DecodedFrame {
+            success: false,
+            command: UG1_REJECTED.to_string(),
+            raw: bytes.to_vec(),
+            data: json!({ "success": false, "rejectedValue": bytes[3] }),
+        });
+    }
     if bytes.len() < 8 {
         if bytes.len() >= 5 && bytes[0..3] == UG1_HW_HEADER {
             return decode_ug1_hardware(bytes);
@@ -664,6 +695,10 @@ fn parse_ug1_device_state(payload: &[u8]) -> Value {
     if let Some(volume) = prompt_volume {
         value["promptVolume"] = json!(volume);
     }
+    // Bytes 8..16 hold the button actions (same layout as KEY_SETTING).
+    if let Some(buttons) = payload.get(8..16) {
+        value["buttons"] = json!(buttons);
+    }
 
     value
 }
@@ -741,6 +776,7 @@ fn ug1_command_name(command_id: u8) -> &'static str {
         UG1_CMD_SOUND_VOLUME => "PROMPT_VOL",
         UG1_CMD_SPATIAL_AUDIO => "SPATIAL_AUDIO",
         UG1_CMD_WEAR_DETECTION => "WEAR_DETECTION",
+        UG1_CMD_KEY_SETTING => "KEY_SETTING",
         _ => "UNKNOWN",
     }
 }
@@ -807,7 +843,8 @@ fn encode_ug2(command: &ProtocolCommand, payload: &Value, seq: u8) -> Result<Vec
         ProtocolCommand::SetGameMode { .. }
         | ProtocolCommand::SetDualConnect { .. }
         | ProtocolCommand::SetSpatialAudio { .. }
-        | ProtocolCommand::SetHighQuality { .. } => {
+        | ProtocolCommand::SetHighQuality { .. }
+        | ProtocolCommand::SetButtons { .. } => {
             return Err(anyhow!("UG2 command `{}` is not implemented yet", command.name()));
         }
         ProtocolCommand::FactoryReset => (UG2_MAGIC_FACTORY_RESET, Vec::new()),
@@ -996,6 +1033,8 @@ fn normalize_anc_mode(mode: &str) -> &'static str {
         "medium" => "medium",
         "deep" => "deep",
         "auto" | "adaptive" | "anc" | "on" => "adaptive",
+        "basic-off" => "basic-off",
+        "basic-transparent" => "basic-transparent",
         _ => "adaptive",
     }
 }
@@ -1010,6 +1049,10 @@ fn normalize_anc_depth(depth: u8) -> &'static str {
 
 fn map_ug1_anc_mode_value(value: &str) -> u8 {
     match value {
+        // Max5 encodes off and transparency without a depth nibble (0x00 / 0x02);
+        // its ANC levels use the shared 0xC1 / 0xB1 / 0xA1 values below.
+        "basic-off" => 0,
+        "basic-transparent" => 2,
         "off" => 208, // 0xD0
         "transparent" | "transparency" => 210, // 0xD2
         "deep" => 161, // 0xA1
@@ -1096,6 +1139,7 @@ fn normalize_eq_mode(mode: &str) -> &'static str {
         "rock" => "rock",
         "bass" => "bass",
         "treble" => "treble",
+        "original" => "original",
         "classic" | "balanced" | "default" => "classic",
         _ => "classic",
     }
@@ -1111,12 +1155,15 @@ fn eq_mode_to_value(mode: &str) -> u8 {
         "bass" => 6,
         "treble" => 7,
         "classic" => 8,
+        // Max5 reports 0 for its stock tuning, which has no name in the catalog.
+        "original" => 0,
         _ => 8,
     }
 }
 
 fn eq_value_to_mode(value: u8) -> &'static str {
     match value {
+        0 => "original",
         1 => "jazz",
         2 => "electronic",
         3 => "pop",
@@ -1238,6 +1285,45 @@ mod tests {
             assert_eq!(encoded[4], expected_data.len() as u8);
             assert_eq!(&encoded[5..5 + expected_data.len()], expected_data.as_slice());
         }
+    }
+
+    #[test]
+    fn test_ug1_reject_frame() {
+        // Max5 answer to an ANC change sent while the previous prompt was playing.
+        let reject = [0xDD, 0xEE, 0xFF, 0xB1, 0x00, 0x30, 0x33];
+        assert_eq!(find_ug1_reject_frame(&reject), Some(reject.to_vec()));
+        let decoded = decode_ug1(&reject).expect("decode reject");
+        assert!(!decoded.success);
+        assert_eq!(decoded.command, UG1_REJECTED);
+
+        // A regular ack is neither found nor decoded as a reject.
+        let ack = [0xDD, 0xEE, 0xFF, 0x09, 0x01, 0x01, 0xB1, 0xC4, 0x4C];
+        assert_eq!(find_ug1_reject_frame(&ack), None);
+        assert!(decode_ug1(&ack).expect("decode ack").success);
+        // Nor is the first 7 bytes of an ack (status byte is 0x01).
+        assert_eq!(find_ug1_reject_frame(&ack[..7]), None);
+    }
+
+    #[test]
+    fn test_ug1_encode_buttons() {
+        let actions = [8, 0, 0, 7, 0, 0, 0, 0];
+        let cmd = ProtocolCommand::SetButtons { actions };
+        let encoded = encode_ug1(&cmd, &cmd.payload(ProtocolType::Ug1)).expect("encode_ug1 failed");
+        assert_eq!(encoded[3], UG1_CMD_KEY_SETTING);
+        assert_eq!(encoded[4], 8);
+        assert_eq!(&encoded[5..13], &actions);
+    }
+
+    #[test]
+    fn test_ug1_device_state_buttons() {
+        // Max5 state captured from a real device.
+        let payload = [
+            0x3C, 0xFF, 0xFF, 0xA1, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x07, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let state = parse_ug1_device_state(&payload);
+        assert_eq!(state["buttons"], json!([8, 0, 0, 7, 0, 0, 0, 0]));
+        assert_eq!(state["promptLanguage"], "English");
     }
 
     #[test]
